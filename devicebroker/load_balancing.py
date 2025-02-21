@@ -1,10 +1,11 @@
 from dataclasses import dataclass
 import logging
-from multiprocessing.connection import PipeConnection
-from typing import Collection, Dict, List, Optional, Tuple
+from multiprocessing.connection import Connection
+from typing import Collection, Dict, List, Optional, Set, Tuple
 from websockets.asyncio.server import ServerConnection
 import asyncio
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
 
 from . import worker
 from . import commands
@@ -77,13 +78,15 @@ class LoadBalancer:
     worker_index        : int
     next_client_id      : int
     lock                : asyncio.Lock
-    worker_connections  : List[Tuple[PipeConnection, asyncio.Lock]]
+    worker_connections  : List[Tuple[Connection, asyncio.Lock]]
     worker_processes    : List[mp.Process]
 
     clients_map         : Dict[int, OnlineDevice]
     devices_map         : Dict[str, OnlineDevice]
 
-    def __init__(self, pipes : Collection[PipeConnection]):
+    misc_tasks          : Set[asyncio.Task]
+
+    def __init__(self, pipes : Collection[Connection]):
         super().__init__()
 
         self.worker_index       = 0
@@ -93,6 +96,7 @@ class LoadBalancer:
 
         self.clients_map        = dict()
         self.devices_map        = dict()
+        self.misc_tasks         = set()
 
     async def serve_device(self, sock : ServerConnection):
         looper = asyncio.get_running_loop()
@@ -149,20 +153,21 @@ class LoadBalancer:
             
             LOG.info(f"Removed client {online_device.client_id}")
 
-    async def serve_application(self, conn : PipeConnection):
+    async def serve_application(self, conn : Connection):
         looper = asyncio.get_running_loop()
-        while True:
-            try:
-                cmd, *args = await looper.run_in_executor(None, conn.recv)
-            except EOFError:
-                break
+        with ThreadPoolExecutor(max_workers = 1) as executor:
+            while True:
+                try:
+                    cmd, *args = await looper.run_in_executor(executor, conn.recv)
+                except EOFError:
+                    break
 
-            resp = await self.process_message_from_application(looper, cmd, args)
+                resp = await self.process_message_from_application(looper, cmd, args)
 
-            if resp is None:
-                break
+                if resp is None:
+                    break
 
-            await looper.run_in_executor(None, conn.send, resp)
+                await looper.run_in_executor(None, conn.send, resp)
 
     async def process_message_from_application(self, looper : asyncio.AbstractEventLoop, cmd : int, args : tuple) -> Optional[tuple]:
         if cmd == commands.FIND_DEVICE_BY_ID:
@@ -237,9 +242,13 @@ class LoadBalancer:
         looper = asyncio.get_running_loop()
         pipe, _ = self.worker_connections[worker_index]
 
-        while True:
-            cmd, *args = await looper.run_in_executor(None, pipe.recv)
-            await self.process_message_from_worker(worker_index, cmd, args)
+        try:
+            with ThreadPoolExecutor(max_workers = 1) as executor:
+                while True:
+                    cmd, *args = await looper.run_in_executor(executor, pipe.recv)
+                    await self.process_message_from_worker(worker_index, cmd, args)
+        except Exception as ex:
+            LOG.error(f"Exception while processing message from worker : {ex}")
 
     async def process_message_from_worker(self, worker_index : int, cmd : int, args : tuple):
         if cmd == commands.ASSIGN_DEVICE_ID:
@@ -254,6 +263,9 @@ class LoadBalancer:
                         self.devices_map.pop(online_device.device_id, None)
 
                     existing_device = self.devices_map.pop(device_id, None)
+                    if existing_device is not None:
+                        existing_device.device_id = None
+
                     online_device.device_id = device_id
                     online_device.attribs   = device_attribs
 
@@ -262,7 +274,9 @@ class LoadBalancer:
 
             if existing_device is not None:
                 LOG.warn(f"Disconnecting old client {existing_device.client_id} with assigned device ID {device_id}")
-                existing_device.connection.close_transport()
+                task : asyncio.Task = asyncio.create_task(existing_device.connection.close())
+                self.misc_tasks.add(task)
+                task.add_done_callback(self.misc_tasks.discard)
 
             if online_device is not None:
                 LOG.info(f"Assigned device ID {device_id} to client {client_id}")

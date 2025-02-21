@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import multiprocessing as mp
 import multiprocessing.connection as mpc
@@ -24,12 +25,13 @@ async def run_application_server(loadbalancer : LoadBalancer, sock_name : str):
         address = sock_name
 
     tasks = set()
-    with mpc.Listener(address) as listener:
-        while True:
-            conn : mpc.Connection = await loop.run_in_executor(None, listener.accept)
-            task : asyncio.Task = asyncio.create_task(loadbalancer.serve_application(conn))
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
+    with ThreadPoolExecutor(max_workers = 1) as executor:
+        with mpc.Listener(address) as listener:
+            while True:
+                conn : mpc.Connection = await loop.run_in_executor(executor, listener.accept)
+                task : asyncio.Task = asyncio.create_task(loadbalancer.serve_application(conn))
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
 
 async def wait_cancellation(cancellation : asyncio.Future):
     await cancellation
@@ -37,7 +39,7 @@ async def wait_cancellation(cancellation : asyncio.Future):
 async def main(args):
     num_workers : int = args.workers
     if num_workers <= 0:
-        num_workers = mp.cpu_count() * 2
+        num_workers = mp.cpu_count()
 
     # Create pipes
     host_pipes, worker_pipes = zip(*(mp.Pipe() for _ in range(0, num_workers)))
@@ -67,7 +69,7 @@ async def main(args):
 
     finally:
         for pipe in host_pipes:
-            pipe : mpc.PipeConnection
+            pipe : mpc.Connection
             pipe.close()
         worker_host.stop()
 

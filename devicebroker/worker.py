@@ -27,11 +27,11 @@ def create_text_element(tag : str, text : str) -> ElementTree.Element:
 
 
 class Worker:
-    connection          : mpc.PipeConnection
+    connection          : mpc.Connection
     webapp_url          : str
     device_logged_in    : Dict[int, bool]
 
-    def __init__(self, conn : mpc.PipeConnection, webapp_url : str):
+    def __init__(self, conn : mpc.Connection, webapp_url : str):
         super().__init__()
 
         self.connection         = conn
@@ -39,7 +39,7 @@ class Worker:
         self.device_logged_in   = dict()
 
     @classmethod
-    def run(cls, conn : mpc.PipeConnection, webapp_url : str):
+    def run(cls, conn : mpc.Connection, webapp_url : str):
         self = Worker(conn, webapp_url)
 
         while True:
@@ -192,7 +192,7 @@ class Worker:
 class WorkerHost:
     workers : List[mp.Process]
 
-    def __init__(self, pipes : List[mpc.PipeConnection], webapp_url : str):
+    def __init__(self, pipes : List[mpc.Connection], webapp_url : str):
         super().__init__()
 
         self.workers = [mp.Process(target = Worker.run, args = (x, webapp_url)) for x in pipes]
